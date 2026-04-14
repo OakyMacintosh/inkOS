@@ -1,0 +1,9 @@
+[package]
+name = "inkbootstrap"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+
+[env]
+target = wasm32-wasip2
