@@ -22,6 +22,7 @@ Options:
   -q, --quality  0-95     JPEG quality (default: 85)
   --grayscale             Convert pages to grayscale (better for e-ink)
   --dither                Apply Floyd-Steinberg dithering (grayscale only)
+  --no-render-text        Disable automatic text rendering and keep page image rendering
   --title TEXT            Override book title
   --author TEXT           Override book author
 """
@@ -31,6 +32,7 @@ import json
 import os
 import re
 import sys
+import textwrap
 from pathlib import Path
 from typing import Optional
 
@@ -41,7 +43,7 @@ except ImportError:
     sys.exit("Missing dependency: pip install pymupdf")
 
 try:
-    from PIL import Image, ImageFilter, ImageOps
+    from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps
 except ImportError:
     sys.exit("Missing dependency: pip install Pillow")
 
@@ -115,6 +117,73 @@ def page_filename(n: int) -> str:
     return f"page{n:04d}.jpg"
 
 
+FONT_PATHS = [
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf",
+    "/usr/share/fonts/truetype/liberation/LiberationSerif-Regular.ttf",
+]
+
+
+def load_font(font_size: int) -> ImageFont.ImageFont:
+    for path in FONT_PATHS:
+        if os.path.exists(path):
+            try:
+                return ImageFont.truetype(path, font_size)
+            except OSError:
+                continue
+    return ImageFont.load_default()
+
+
+def render_text_pages(page: fitz.Page, width: int, height: int) -> list[Image.Image]:
+    text = page.get_text("text").strip()
+    if not text:
+        return []
+
+    # Use a larger font for smaller resolutions so rendered text is readable.
+    font_size = min(72, max(18, int(min(width, height) / 12)))
+    if width <= 360:
+        font_size = max(font_size, 20)
+    font = load_font(font_size)
+
+    try:
+        sample = Image.new("RGB", (1, 1), (255, 255, 255))
+        draw = ImageDraw.Draw(sample)
+        avg_char_width = draw.textlength("M", font=font)
+    except Exception:
+        avg_char_width = font_size * 0.6
+    if avg_char_width <= 0:
+        avg_char_width = font_size * 0.6
+
+    max_chars = max(16, int((width - 16) / avg_char_width))
+    lines = []
+    for paragraph in text.splitlines():
+        if not paragraph.strip():
+            lines.append("")
+            continue
+        wrapped = textwrap.wrap(paragraph, width=max_chars,
+                                 break_long_words=True,
+                                 break_on_hyphens=False)
+        lines.extend(wrapped or [""])
+
+    line_height = int(font_size * 1.4)
+    pages: list[Image.Image] = []
+    canvas = Image.new("RGB", (width, height), (255, 255, 255))
+    draw = ImageDraw.Draw(canvas)
+    y = 8
+
+    for line in lines:
+        if y + line_height > height - 8:
+            pages.append(canvas)
+            canvas = Image.new("RGB", (width, height), (255, 255, 255))
+            draw = ImageDraw.Draw(canvas)
+            y = 8
+        draw.text((8, y), line, fill=(0, 0, 0), font=font)
+        y += line_height
+
+    pages.append(canvas)
+    return pages
+
+
 # ── PDF conversion ─────────────────────────────────────────────────────────────
 
 def convert_pdf(src: Path,
@@ -125,7 +194,8 @@ def convert_pdf(src: Path,
                 grayscale: bool,
                 dither: bool,
                 title_override: Optional[str],
-                author_override: Optional[str]) -> dict:
+                author_override: Optional[str],
+                render_text: bool) -> dict:
 
     doc = fitz.open(str(src))
     meta = doc.metadata
@@ -137,34 +207,48 @@ def convert_pdf(src: Path,
     creator   = meta.get("creator",  "")
     page_count = doc.page_count
 
-    # Render scale: we want pages at at least 2× the target to downsample nicely
-    scale = max(2.0, width / 100)
+    # Render scale: we want pages at at least 4× the target to downsample nicely for readability
+    scale = max(4.0, width / 50)
     mat   = fitz.Matrix(scale, scale)
 
     print(f"  Source     : {src.name}")
     print(f"  Pages      : {page_count}")
     print(f"  Target     : {width}×{height}  quality={quality}")
 
+    output_count = 0
     for i, page in enumerate(doc):
-        pix  = page.get_pixmap(matrix=mat, alpha=False)
-        img  = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
-        img  = fit_image(img, width, height)
-        img  = apply_eink_optimisation(img, grayscale, dither)
-        dest = out_dir / page_filename(i + 1)
-        img.save(str(dest), "JPEG", quality=quality, optimize=True,
-                 progressive=False)
-        print(f"  [{i+1:>4}/{page_count}] {dest.name}", end="\r", flush=True)
+        if render_text:
+            imgs = render_text_pages(page, width, height)
+        else:
+            imgs = []
+
+        if not imgs:
+            pix  = page.get_pixmap(matrix=mat, alpha=False)
+            img  = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+            img  = fit_image(img, width, height)
+            imgs = [img]
+
+        for img in imgs:
+            img  = apply_eink_optimisation(img, grayscale, dither)
+            output_count += 1
+            dest = out_dir / page_filename(output_count)
+            img.save(str(dest), "JPEG", quality=quality, optimize=True,
+                     progressive=False)
+            print(f"  [{output_count:>4}] {dest.name}", end="\r", flush=True)
 
     print()  # newline after \r
 
+    page_count = output_count
+
     return {
-        "title":     title,
-        "author":    author,
-        "subject":   subject,
-        "keywords":  keywords,
-        "creator":   creator,
-        "source":    "pdf",
+        "title":      title,
+        "author":     author,
+        "subject":    subject,
+        "keywords":   keywords,
+        "creator":    creator,
+        "source":     "pdf",
         "page_count": page_count,
+        "render_text": render_text,
     }
 
 
@@ -192,7 +276,8 @@ def convert_epub(src: Path,
                  grayscale: bool,
                  dither: bool,
                  title_override: Optional[str],
-                 author_override: Optional[str]) -> dict:
+                 author_override: Optional[str],
+                 render_text: bool) -> dict:
 
     # --- metadata via ebooklib ---
     book = epub.read_epub(str(src), options={"ignore_ncx": True})
@@ -215,24 +300,37 @@ def convert_epub(src: Path,
     doc = fitz.open(str(src))
     page_count = doc.page_count
 
-    scale = max(2.0, width / 100)
+    scale = max(4.0, width / 50)
     mat   = fitz.Matrix(scale, scale)
 
     print(f"  Source     : {src.name}")
     print(f"  Pages      : {page_count}")
     print(f"  Target     : {width}×{height}  quality={quality}")
 
+    output_count = 0
     for i, page in enumerate(doc):
-        pix = page.get_pixmap(matrix=mat, alpha=False)
-        img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
-        img = fit_image(img, width, height)
-        img = apply_eink_optimisation(img, grayscale, dither)
-        dest = out_dir / page_filename(i + 1)
-        img.save(str(dest), "JPEG", quality=quality, optimize=True,
-                 progressive=False)
-        print(f"  [{i+1:>4}/{page_count}] {dest.name}", end="\r", flush=True)
+        if render_text:
+            imgs = render_text_pages(page, width, height)
+        else:
+            imgs = []
+
+        if not imgs:
+            pix = page.get_pixmap(matrix=mat, alpha=False)
+            img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+            img = fit_image(img, width, height)
+            imgs = [img]
+
+        for img in imgs:
+            img = apply_eink_optimisation(img, grayscale, dither)
+            output_count += 1
+            dest = out_dir / page_filename(output_count)
+            img.save(str(dest), "JPEG", quality=quality, optimize=True,
+                     progressive=False)
+            print(f"  [{output_count:>4}] {dest.name}", end="\r", flush=True)
 
     print()
+
+    page_count = output_count
 
     return {
         "title":      title,
@@ -243,6 +341,7 @@ def convert_epub(src: Path,
         "date":       date,
         "source":     "epub",
         "page_count": page_count,
+        "render_text": render_text,
     }
 
 
@@ -255,7 +354,8 @@ def write_info(out_dir: Path,
                quality: int,
                grayscale: bool,
                dither: bool,
-               resolution_name: str) -> None:
+               resolution_name: str,
+               render_text: bool) -> None:
 
     info = {
         "inkbook_version": INKBOOK_VERSION,
@@ -276,6 +376,7 @@ def write_info(out_dir: Path,
             "quality": quality,
             "grayscale": grayscale,
             "dither":    dither,
+            "render_text": render_text,
         },
         "pages": [page_filename(n + 1) for n in range(book_meta.get("page_count", 0))],
     }
@@ -342,6 +443,7 @@ def cmd_info(args) -> None:
     print(f"  JPEG quality: {conv.get('quality')}")
     print(f"  Grayscale  : {conv.get('grayscale')}")
     print(f"  Dither     : {conv.get('dither')}")
+    print(f"  Render text: {conv.get('render_text')}")
     print(f"  InkBook ver: {info.get('inkbook_version', '—')}")
 
 
@@ -388,16 +490,18 @@ def cmd_convert(args) -> None:
             src, out_dir, width, height, quality,
             grayscale, dither,
             args.title, args.author,
+            args.render_text,
         )
     else:
         meta = convert_epub(
             src, out_dir, width, height, quality,
             grayscale, dither,
             args.title, args.author,
+            args.render_text,
         )
 
     write_info(out_dir, meta, width, height, quality,
-               grayscale, dither, res_name)
+               grayscale, dither, res_name, args.render_text)
 
     total = sum(
         (out_dir / page_filename(n + 1)).stat().st_size
@@ -433,6 +537,9 @@ def main() -> None:
                         help="Convert to grayscale (recommended for e-ink)")
     p_conv.add_argument("--dither",     action="store_true",
                         help="Apply Floyd-Steinberg dithering (implies --grayscale)")
+    p_conv.add_argument("--no-render-text", dest="render_text",
+                        action="store_false", default=True,
+                        help="Disable automatic text rendering and keep page image rendering")
     p_conv.add_argument("--title",  help="Override book title")
     p_conv.add_argument("--author", help="Override book author")
     p_conv.add_argument("--force",  action="store_true",
