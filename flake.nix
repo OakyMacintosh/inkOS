@@ -39,6 +39,8 @@
             # pkgsCross.avr.buildPackages.binutils
 
             avrdude
+            uv
+            koreader
           ];
         };
       });

@@ -1,0 +1,15 @@
+[project]
+name = "inkreader"
+version = "0.1.0"
+description = "InkReader setup CLI"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "ebooklib>=0.20",
+    "json5>=0.14.0",
+    "pillow>=12.2.0",
+    "pyinstaller>=6.19.0",
+    "pymupdf>=1.27.2.2",
+    "rich>=15.0.0",
+    "typer>=0.24.1",
+]

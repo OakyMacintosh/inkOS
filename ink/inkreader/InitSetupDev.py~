@@ -1,0 +1,8 @@
+from rich import rich.print as print
+from rich import screeen
+
+class Setup:
+    def __init__(self):
+        return self
+    
+    #
